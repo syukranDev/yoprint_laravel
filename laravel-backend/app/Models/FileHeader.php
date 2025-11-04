@@ -12,7 +12,18 @@ class FileHeader extends Model
 
     protected $fillable = [
         'file_name',
+        'file_hash',
         'status',
+        'total_rows',
+        'processed_rows',
+        'successful_rows',
+        'failed_rows',
+        'error_message',
+        'completed_at',
+    ];
+
+    protected $casts = [
+        'completed_at' => 'datetime',
     ];
 
     /**

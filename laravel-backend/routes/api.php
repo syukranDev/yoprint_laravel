@@ -19,5 +19,7 @@ Route::post('/files/upload', [FileUploadController::class, 'upload']);
 
 Route::get('/files', [FileUploadController::class, 'listFiles']);
 
+Route::get('/files/{id}/status', [FileUploadController::class, 'getStatus']);
+
 Route::get('/files/details', [FileUploadController::class, 'getByUniqueKey']);
 

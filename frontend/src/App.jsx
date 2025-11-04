@@ -3,11 +3,12 @@ import { FileUpload } from "./components/FileUpload"
 import { FileList } from "./components/FileList"
 
 function App() {
-  const [uploadedFile, setUploadedFile] = useState(null)
+  const [refreshTrigger, setRefreshTrigger] = useState(0)
 
-  const handleFileSelect = (file) => {
-    setUploadedFile(file)
-    console.log("File selected:", file.name)
+  const handleUploadSuccess = (fileHeaderId) => {
+    // Trigger refresh by updating the refresh trigger
+    // fileHeaderId is optional - can be used for immediate status polling if needed
+    setRefreshTrigger((prev) => prev + 1)
   }
 
   return (
@@ -17,13 +18,13 @@ function App() {
           <div className="text-center space-y-2">
             <h1 className="text-3xl font-bold tracking-tight">File Upload</h1>
             <p className="text-muted-foreground">
-              Upload your files and manage them easily
+              Upload your CSV files and manage them easily
             </p>
           </div>
 
-          <FileUpload onFileSelect={handleFileSelect} />
+          <FileUpload onUploadSuccess={handleUploadSuccess} />
 
-          <FileList />
+          <FileList refreshTrigger={refreshTrigger} />
         </div>
       </div>
     </div>

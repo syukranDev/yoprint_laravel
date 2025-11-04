@@ -2,18 +2,20 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\ProcessCsvFile;
 use App\Models\FileDetail;
 use App\Models\FileHeader;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 
 class FileUploadController extends Controller
 {
     /**
-     * Expected CSV columns
+     * Valid database columns (only these will be processed, extra columns ignored)
      */
-    private const REQUIRED_COLUMNS = [
+    private const VALID_DB_COLUMNS = [
         'UNIQUE_KEY',
         'PRODUCT_TITLE',
         'PRODUCT_DESCRIPTION',
@@ -30,7 +32,7 @@ class FileUploadController extends Controller
     public function upload(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'files.*' => 'required|file|mimes:csv,txt|max:10240', // max 10MB per file
+            'files.*' => 'required|file|mimes:csv,txt|max:51200', // max 50MB per file
         ]);
 
         if ($validator->fails()) {
@@ -44,24 +46,18 @@ class FileUploadController extends Controller
         $files = $request->file('files');
         $results = [];
 
-        DB::beginTransaction();
-
         try {
             foreach ($files as $file) {
-                $result = $this->processCsvFile($file);
+                $result = $this->prepareFileForProcessing($file);
                 $results[] = $result;
             }
 
-            DB::commit();
-
             return response()->json([
                 'status' => 'success',
-                'message' => 'Files processed successfully',
+                'message' => 'Files uploaded successfully. Processing in background.',
                 'data' => $results,
             ], 200);
         } catch (\Exception $e) {
-            DB::rollBack();
-
             return response()->json([
                 'status' => 'error',
                 'message' => $e->getMessage(),
@@ -70,102 +66,136 @@ class FileUploadController extends Controller
     }
 
     /**
-     * Process a single CSV file
+     * Prepare file for background processing
      */
-    private function processCsvFile($file)
+    private function prepareFileForProcessing($file)
     {
         $fileName = $file->getClientOriginalName();
-        $handle = fopen($file->getRealPath(), 'r');
-
-        if ($handle === false) {
-            throw new \Exception("Unable to open file: {$fileName}");
-        }
-
-        $headers = fgetcsv($handle);
+        $filePath = $file->getRealPath();
         
-        if ($headers === false) {
-            fclose($handle);
-            throw new \Exception("File is empty or invalid: {$fileName}");
+        // Calculate file hash for idempotency
+        $fileHash = hash_file('sha256', $filePath);
+        
+        // Check if file with same hash already exists (idempotency check)
+        $existingFileHeader = FileHeader::where('file_hash', $fileHash)->first();
+        
+        if ($existingFileHeader) {
+            return [
+                'file_name' => $fileName,
+                'file_header_id' => $existingFileHeader->id,
+                'status' => 'skipped',
+                'message' => 'File already uploaded (idempotent)',
+            ];
         }
-
-        $this->validateHeaders($headers, $fileName);
-
+        
+        // Store file temporarily
+        $tempPath = storage_path('app/temp/' . uniqid() . '_' . $fileName);
+        if (!file_exists(storage_path('app/temp'))) {
+            mkdir(storage_path('app/temp'), 0755, true);
+        }
+        copy($filePath, $tempPath);
+        
+        // Create file header record with processing status
         $fileHeader = FileHeader::create([
             'file_name' => $fileName,
-            'status' => 'uploaded',
+            'file_hash' => $fileHash,
+            'status' => 'processing',
         ]);
-
-        $rowCount = 0;
-        $errors = [];
-
-        while (($row = fgetcsv($handle)) !== false) {
-            $rowCount++;
-            
-            if (empty(array_filter($row))) {
-                continue;
-            }
-
-            $rowData = array_combine($headers, $row);
-            
-            if ($rowData === false) {
-                $errors[] = "Row {$rowCount}: Column count mismatch";
-                continue;
-            }
-
-            if (empty($rowData['UNIQUE_KEY']) || empty($rowData['PRODUCT_TITLE']) || empty($rowData['PRODUCT_DESCRIPTION'])) {
-                $errors[] = "Row {$rowCount}: Missing required fields (UNIQUE_KEY, PRODUCT_TITLE, or PRODUCT_DESCRIPTION)";
-                continue;
-            }
-
-            try {
-                FileDetail::create([
-                    'file_header_id' => $fileHeader->id,
-                    'UNIQUE_KEY' => $rowData['UNIQUE_KEY'],
-                    'PRODUCT_TITLE' => $rowData['PRODUCT_TITLE'],
-                    'PRODUCT_DESCRIPTION' => $rowData['PRODUCT_DESCRIPTION'],
-                    'STYLE#' => $rowData['STYLE#'] ?? null,
-                    'SANMAR_MAINFRAME_COLOR' => $rowData['SANMAR_MAINFRAME_COLOR'] ?? null,
-                    'SIZE' => $rowData['SIZE'] ?? null,
-                    'COLOR_NAME' => $rowData['COLOR_NAME'] ?? null,
-                    'PIECE_PRICE' => !empty($rowData['PIECE_PRICE']) ? (float) $rowData['PIECE_PRICE'] : null,
-                ]);
-            } catch (\Exception $e) {
-                $errors[] = "Row {$rowCount}: " . $e->getMessage();
-            }
-        }
-
-        fclose($handle);
-
-        $status = empty($errors) ? 'processed' : 'processed_with_errors';
-        $fileHeader->update(['status' => $status]);
-
+        
+        // Dispatch job to process CSV in background
+        ProcessCsvFile::dispatch($fileHeader->id, $tempPath, $fileName);
+        
         return [
             'file_name' => $fileName,
             'file_header_id' => $fileHeader->id,
-            'rows_processed' => $rowCount,
-            'status' => $status,
-            'errors' => $errors,
+            'status' => 'processing',
+            'message' => 'File uploaded. Processing in background.',
         ];
     }
 
     /**
-     * Validate CSV headers
+     * Get file processing status
      */
-    private function validateHeaders(array $headers, string $fileName)
+    public function getStatus($id)
     {
-        $headers = array_map('trim', $headers);
+        $fileHeader = FileHeader::find($id);
+
+        if (!$fileHeader) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'File not found',
+            ], 404);
+        }
+
+        // Calculate progress percentage
+        $progress = 0;
+        if ($fileHeader->total_rows > 0) {
+            $progress = round(($fileHeader->processed_rows / $fileHeader->total_rows) * 100, 2);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data' => [
+                'id' => $fileHeader->id,
+                'file_name' => $fileHeader->file_name,
+                'status' => $fileHeader->status,
+                'total_rows' => $fileHeader->total_rows,
+                'processed_rows' => $fileHeader->processed_rows,
+                'successful_rows' => $fileHeader->successful_rows,
+                'failed_rows' => $fileHeader->failed_rows,
+                'progress_percentage' => $progress,
+                'error_message' => $fileHeader->error_message,
+                'created_at' => $fileHeader->created_at,
+                'completed_at' => $fileHeader->completed_at,
+            ],
+        ], 200);
+    }
+
+    /**
+     * Clean non-UTF-8 characters from string or array
+     */
+    private function cleanUtf8($data)
+    {
+        if (is_array($data)) {
+            return array_map([$this, 'cleanUtf8'], $data);
+        }
         
-        $missingColumns = [];
-        foreach (self::REQUIRED_COLUMNS as $column) {
-            if (!in_array($column, $headers, true)) {
-                $missingColumns[] = $column;
-            }
+        if (!is_string($data)) {
+            return $data;
         }
-
-        if (!empty($missingColumns)) {
-            throw new \Exception("File '{$fileName}' has missing columns: " . implode(', ', $missingColumns));
+        
+        // Use iconv to remove invalid UTF-8 sequences
+        $cleaned = @iconv('UTF-8', 'UTF-8//IGNORE', $data);
+        
+        // If iconv fails, try mb_convert_encoding
+        if ($cleaned === false) {
+            $cleaned = mb_convert_encoding($data, 'UTF-8', 'UTF-8');
         }
+        
+        // Remove any control characters except newlines (\n), tabs (\t), and carriage returns (\r)
+        $cleaned = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $cleaned);
+        
+        // Final validation - ensure it's valid UTF-8
+        if (!mb_check_encoding($cleaned, 'UTF-8')) {
+            // Last resort: convert again and remove any remaining invalid sequences
+            $cleaned = mb_convert_encoding($cleaned, 'UTF-8', 'UTF-8');
+            // Remove any bytes that aren't valid UTF-8
+            $cleaned = preg_replace('/[\x{10000}-\x{10FFFF}]/u', '', $cleaned);
+        }
+        
+        return trim($cleaned);
+    }
 
+    /**
+     * Clean UTF-8 from array values recursively
+     */
+    private function cleanUtf8Array(array $data): array
+    {
+        $cleaned = [];
+        foreach ($data as $key => $value) {
+            $cleaned[$key] = $this->cleanUtf8($value);
+        }
+        return $cleaned;
     }
 
     /**
